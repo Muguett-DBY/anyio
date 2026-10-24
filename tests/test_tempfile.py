@@ -85,7 +85,7 @@ class TestSpooledTemporaryFile:
         missing_dir = tmp_path / "missing"
         async with SpooledTemporaryFile[bytes](max_size=8, dir=str(missing_dir)) as stf:
             await stf.write(b"aaaa")
-            with pytest.raises(OSError):
+            with pytest.raises(FileNotFoundError):
                 await stf.write(b"bbbbbbbb")
 
             assert not stf._rolled
@@ -95,6 +95,63 @@ class TestSpooledTemporaryFile:
             assert stf._rolled
             await stf.seek(0)
             assert await stf.read() == b"aaaabbbbbbbbcc"
+
+    async def test_rollover_failure_retains_text(self, tmp_path: pathlib.Path) -> None:
+        missing_dir = tmp_path / "missing"
+        async with SpooledTemporaryFile[str](
+            max_size=8, mode="w+", encoding="utf-8", newline="", dir=str(missing_dir)
+        ) as stf:
+            await stf.write("a\r\n")
+            with pytest.raises(FileNotFoundError):
+                await stf.write("é\r\né")
+
+            assert not stf._rolled
+            assert await stf.tell() == 9
+            missing_dir.mkdir()
+            await stf.write("cc")
+            assert stf._rolled
+            await stf.seek(0)
+            assert await stf.read() == "a\r\né\r\nécc"
+
+    async def test_text_rollover_preserves_newlines(self) -> None:
+        async with SpooledTemporaryFile[str](
+            mode="w+", encoding="utf-8", newline="\r\n"
+        ) as stf:
+            await stf.write("é\nline\n")
+            await stf.seek(4)
+            await stf.rollover()
+
+            assert await stf.tell() == 4
+            assert await stf.read() == "line\r\n"
+            await stf.seek(0)
+            assert await stf.read() == "é\r\nline\r\n"
+
+    @pytest.mark.parametrize("operation", ["write", "seek"])
+    async def test_rollover_copy_error_closes_file(self, operation: str) -> None:
+        async with SpooledTemporaryFile() as stf:
+            await stf.write(b"hello world")
+            await stf.seek(5)
+            with tempfile.TemporaryFile() as new_file:
+                with patch(
+                    "anyio._core._tempfile.tempfile.TemporaryFile",
+                    return_value=new_file,
+                ):
+                    with patch.object(
+                        new_file, operation, side_effect=OSError("copy failed")
+                    ):
+                        with pytest.raises(OSError, match="copy failed"):
+                            await stf.rollover()
+
+                assert new_file.closed
+
+            assert not stf._rolled
+            assert await stf.tell() == 5
+            await stf.seek(0)
+            assert await stf.read() == b"hello world"
+            await stf.rollover()
+            assert stf._rolled
+            await stf.seek(0)
+            assert await stf.read() == b"hello world"
 
     @pytest.mark.parametrize("use_writelines", [False, True])
     async def test_default_max_size_no_rollover(self, use_writelines: bool) -> None:
